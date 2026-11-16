@@ -98,22 +98,57 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
 
     override fun onCreate() {
         super.onCreate()
+        // Sem permissão de localização o Android recusa o serviço de localização em foreground
+        // (SecurityException) e o app fechava em loop: o serviço é START_STICKY e o Android o
+        // recriava a cada vez (ex.: motorista bloqueou a localização nos ajustes).
+        if (!iniciarEmForeground(getNotification())) {
+            stopSelf()
+            return
+        }
         startLocatorService(this)
-        startForeground(notificationId, getNotification())
+    }
+
+    private fun temPermissaoLocalizacao(): Boolean =
+        ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            || ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    /** Coloca o serviço em foreground; devolve false se não houver permissão ou o Android recusar. */
+    private fun iniciarEmForeground(notification: Notification): Boolean {
+        if (!temPermissaoLocalizacao()) {
+            Log.e("IsolateHolderService", "Sem permissão de localização: serviço não inicia")
+            return false
+        }
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    notificationId,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                )
+            } else {
+                startForeground(notificationId, notification)
+            }
+            true
+        } catch (e: Exception) {
+            // SecurityException ou ForegroundServiceStartNotAllowedException (Android 12+).
+            Log.e("IsolateHolderService", "Android recusou o serviço em foreground: $e")
+            false
+        }
     }
 
     private fun start() {
+        // Starting Service as foreground with a notification prevent service from closing
+        if (!iniciarEmForeground(getNotification())) {
+            stopSelf()
+            return
+        }
+
         (getSystemService(Context.POWER_SERVICE) as PowerManager).run {
             newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
                 setReferenceCounted(false)
                 acquire(wakeLockTime)
             }
         }
-
-        // Starting Service as foreground with a notification prevent service from closing
-        // TODO: Verificar se pode retirar por ser redundante
-        val notification = getNotification()
-        startForeground(notificationId, notification)
 
         pluggables.forEach {
             context?.let { it1 -> it.onServiceStart(it1) }
@@ -123,13 +158,34 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
     private fun getNotification(): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             // Notification channel is available in Android O and up
-            val channel = NotificationChannel(
-                Keys.CHANNEL_ID, notificationChannelName,
-                NotificationManager.IMPORTANCE_LOW
-            )
-
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(channel)
+            val channelName = if (notificationChannelName.isNotEmpty()) {
+                notificationChannelName
+            } else {
+                "Flutter Locator Plugin"
+            }
+            
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            
+            // Cria o canal apenas se não existir
+            if (notificationManager.getNotificationChannel(Keys.CHANNEL_ID) == null) {
+                val channel = NotificationChannel(
+                    Keys.CHANNEL_ID, channelName,
+                    NotificationManager.IMPORTANCE_LOW  // LOW para evitar som/vibração
+                ).apply {
+                    description = "Usado para rastreamento de localização em segundo plano"
+                    setShowBadge(false)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    enableVibration(false)
+                    enableLights(false)
+                    setSound(null, null)
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+        }
+        
+        // Garante que sempre temos um ícone válido
+        if (icon == 0) {
+            icon = applicationInfo.icon
         }
 
         val intent = Intent(this, getMainActivityClass(this))
@@ -151,7 +207,7 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
             )
         }
         
-        return NotificationCompat.Builder(this, Keys.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, Keys.CHANNEL_ID)
             .setContentTitle(notificationTitle)
             .setContentText(notificationMsg)
             .setStyle(
@@ -162,26 +218,38 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
             .setColor(notificationIconColor)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(pendingIntent)
-            .setOnlyAlertOnce(true) // so when data is updated don't make sound and alert in android 8.0+
-            .setOngoing(true)
-            .build()
+            .setOnlyAlertOnce(true)
+            .setOngoing(true) // Permanente - não pode ser dispensada
+            .setAutoCancel(false) // Não cancela ao clicar
+            .setShowWhen(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSound(null)
+            .setVibrate(null)
+            .setDefaults(0)
+            .setLocalOnly(true)
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+        
+        val notification = builder.build()
+        Log.e("IsolateHolderService", "Notificação criada - Ongoing: ${(notification.flags and Notification.FLAG_ONGOING_EVENT) != 0}")
+        return notification
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.e("IsolateHolderService", "onStartCommand => intent.action : ${intent?.action}")
 
-        val notification = getNotification()
-        startForeground(notificationId, notification)
-        
-        if(intent == null) {
-            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
-                || ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                Log.e("IsolateHolderService", "app has crashed, stopping it")
-                stopSelf()
-            }
-            else {
-                return super.onStartCommand(intent, flags, startId)
-            }
+        // Sem permissão: para e não pede para o Android recriar o serviço (era o loop de falhas).
+        if (!iniciarEmForeground(getNotification())) {
+            isServiceRunning = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (intent == null) {
+            return super.onStartCommand(intent, flags, startId)
         }
 
         when {
@@ -213,18 +281,27 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
     private fun startHolderService(intent: Intent) {
         Log.e("IsolateHolderService", "startHolderService")
         notificationChannelName =
-            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_CHANNEL_NAME).toString()
+            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_CHANNEL_NAME) ?: "Flutter Locator Plugin"
         notificationTitle =
-            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_TITLE).toString()
-        notificationMsg = intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_MSG).toString()
+            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_TITLE) ?: "Start Location Tracking"
+        notificationMsg = intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_MSG) ?: "Location tracking active"
         notificationBigMsg =
-            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_BIG_MSG).toString()
+            intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_BIG_MSG) ?: "Background location is on"
         val iconNameDefault = "ic_launcher"
         var iconName = intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_ICON)
         if (iconName == null || iconName.isEmpty()) {
             iconName = iconNameDefault
         }
         icon = resources.getIdentifier(iconName, "drawable", packageName)
+        
+        // Fallback: se o ícone não foi encontrado, tenta mipmap e depois usa o ícone padrão da aplicação
+        if (icon == 0) {
+            icon = resources.getIdentifier(iconName, "mipmap", packageName)
+        }
+        if (icon == 0) {
+            icon = applicationInfo.icon
+        }
+        
         notificationIconColor =
             intent.getLongExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_ICON_COLOR, 0).toInt()
         wakeLockTime = intent.getIntExtra(Keys.SETTINGS_ANDROID_WAKE_LOCK_TIME, 60) * 60 * 1000L
@@ -267,17 +344,22 @@ class IsolateHolderService : MethodChannel.MethodCallHandler, LocationUpdateList
         Log.e("IsolateHolderService", "updateNotification")
         if (intent.hasExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_TITLE)) {
             notificationTitle =
-                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_TITLE).toString()
+                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_TITLE) ?: notificationTitle
         }
 
         if (intent.hasExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_MSG)) {
             notificationMsg =
-                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_MSG).toString()
+                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_MSG) ?: notificationMsg
         }
 
         if (intent.hasExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_BIG_MSG)) {
             notificationBigMsg =
-                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_BIG_MSG).toString()
+                intent.getStringExtra(Keys.SETTINGS_ANDROID_NOTIFICATION_BIG_MSG) ?: notificationBigMsg
+        }
+
+        // Garante que sempre temos um ícone válido
+        if (icon == 0) {
+            icon = applicationInfo.icon
         }
 
         val notification = getNotification()
